@@ -1,0 +1,212 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Énumérations (jamais de chaîne libre pour un statut)
+// ---------------------------------------------------------------------------
+
+enum Role {
+  PARTICIPANT
+  ORGANIZER
+  ADMIN
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  CANCELED
+  REFUNDED
+}
+
+enum SubStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  UNPAID
+  CANCELED
+  INCOMPLETE
+}
+
+enum EventStatus {
+  DRAFT
+  PUBLISHED
+  CANCELED
+}
+
+enum TicketType {
+  REGULAR
+  STUDENT
+}
+
+enum RefundStatus {
+  REQUESTED
+  APPROVED
+  REJECTED
+  COMPLETED
+}
+
+// ---------------------------------------------------------------------------
+// Modèles (montants toujours en cents, Int)
+// ---------------------------------------------------------------------------
+
+model User {
+  id               String   @id @default(cuid())
+  clerkId          String   @unique
+  email            String   @unique
+  role             Role     @default(PARTICIPANT)
+  studentEmail     String?
+  stripeCustomerId String?  @unique
+  createdAt        DateTime @default(now())
+
+  orders          Order[]
+  organizedEvents Event[]       @relation("OrganizedEvents")
+  subscription    Subscription?
+}
+
+model Event {
+  id                String      @id @default(cuid())
+  title             String
+  startsAt          DateTime
+  location          String
+  capacity          Int
+  // RM-01 : mis à jour dans la même transaction que la commande
+  seatsTaken        Int         @default(0)
+  priceCents        Int
+  studentPriceCents Int?
+  status            EventStatus @default(DRAFT)
+  organizerId       String
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  // RM-08 : l'organisateur propriétaire
+  organizer  User        @relation("OrganizedEvents", fields: [organizerId], references: [id], onDelete: Restrict)
+  orderItems OrderItem[]
+  promoCodes PromoCode[]
+
+  @@index([status, startsAt])
+  @@index([organizerId])
+}
+
+model Order {
+  id              String      @id @default(cuid())
+  status          OrderStatus @default(PENDING)
+  // RM-12 / RM-13 : recalculés par le serveur, taxes après rabais
+  subtotalCents   Int
+  discountCents   Int         @default(0)
+  tpsCents        Int
+  tvqCents        Int
+  totalCents      Int
+  // RM-02 : places réservées 30 minutes
+  reservedUntil   DateTime
+  stripeSessionId String?     @unique
+  userId          String
+  promoCodeId     String?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+
+  // ENF-04 : l'utilisateur est anonymisé, jamais supprimé en cascade
+  user      User        @relation(fields: [userId], references: [id], onDelete: Restrict)
+  promoCode PromoCode?  @relation(fields: [promoCodeId], references: [id], onDelete: SetNull)
+  items     OrderItem[]
+  refunds   Refund[]
+
+  @@index([userId])
+  @@index([status, reservedUntil])
+}
+
+// Table de jonction Order <-> Event ; snapshot du prix et du titre (RM-07)
+model OrderItem {
+  orderId        String
+  eventId        String
+  ticketType     TicketType
+  quantity       Int
+  unitPriceCents Int
+  eventTitle     String
+
+  // Composition : supprimer la commande supprime ses lignes
+  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  event Event @relation(fields: [eventId], references: [id], onDelete: Restrict)
+
+  // Un même événement une seule fois par type de billet dans une commande
+  @@id([orderId, eventId, ticketType])
+  @@index([eventId])
+}
+
+model Refund {
+  id             String       @id @default(cuid())
+  amountCents    Int
+  status         RefundStatus @default(REQUESTED)
+  reason         String
+  stripeRefundId String?      @unique
+  orderId        String
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+}
+
+model Subscription {
+  id                   String    @id @default(cuid())
+  status               SubStatus
+  stripeSubscriptionId String    @unique
+  currentPeriodEnd     DateTime
+  // RM-09 : annulation effective à la fin de la période payée
+  cancelAtPeriodEnd    Boolean   @default(false)
+  // RM-05 : période de grâce de 7 jours
+  graceUntil           DateTime?
+  // Un seul abonnement par utilisateur
+  userId               String    @unique
+  planId               String
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Restrict)
+  plan Plan @relation(fields: [planId], references: [id], onDelete: Restrict)
+}
+
+model Plan {
+  id                String @id @default(cuid())
+  name              String
+  monthlyPriceCents Int
+  trialDays         Int
+  stripePriceId     String @unique
+
+  subscriptions Subscription[]
+}
+
+// RM-10 : pourcentage, expiration, utilisations maximales
+model PromoCode {
+  id         String   @id @default(cuid())
+  code       String
+  percentOff Int
+  maxUses    Int
+  usedCount  Int      @default(0)
+  expiresAt  DateTime
+  eventId    String
+  createdAt  DateTime @default(now())
+
+  event  Event   @relation(fields: [eventId], references: [id], onDelete: Restrict)
+  orders Order[]
+
+  @@unique([eventId, code])
+}
+
+// RM-14 : id = identifiant evt_… de Stripe ; un doublon est rejeté par la clé primaire
+model WebhookEvent {
+  id         String   @id
+  type       String
+  receivedAt DateTime @default(now())
+}
